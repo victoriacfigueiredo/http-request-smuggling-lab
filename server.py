@@ -108,57 +108,71 @@ def read_http_request(conn: socket.socket):
     return request_line, headers, body
 
 
-def build_response(status_code: int, reason: str, body: str):
+def build_response(status_code: int, reason: str, body: str, keep_alive=True):
     body_bytes = body.encode("utf-8")
+    connection_value = "keep-alive" if keep_alive else "close"
+
     response = (
         f"HTTP/1.1 {status_code} {reason}\r\n"
         f"Content-Type: text/plain; charset=utf-8\r\n"
         f"Content-Length: {len(body_bytes)}\r\n"
-        f"Connection: close\r\n"
+        f"Connection: {connection_value}\r\n"
         f"\r\n"
     ).encode("iso-8859-1") + body_bytes
+
     return response
 
 
 def handle_client(conn: socket.socket, addr):
     try:
-        request = read_http_request(conn)
-        if request is None:
-            return
+        while True:
+            request = read_http_request(conn)
+            if request is None:
+                break
 
-        request_line, headers, body = request
-        parts = request_line.split(" ")
-        if len(parts) != 3:
-            conn.sendall(build_response(400, "Bad Request", "Request-Line inválida"))
-            return
+            request_line, headers, body = request
 
-        method, target, version = parts
+            parts = request_line.split(" ")
+            if len(parts) != 3:
+                conn.sendall(build_response(400, "Bad Request", "Request-Line inválida"))
+                break
 
-        parsed = urlsplit(target)
-        path = parsed.path or "/"
-        if parsed.query:
-            path += "?" + parsed.query
+            method, target, version = parts
 
-        response_body = (
-            "\nServidor recebeu:\n"
-            f"Cliente TCP: {addr[0]}:{addr[1]}\n"
-            f"Método: {method}\n"
-            f"Target recebido: {target}\n"
-            f"Path interpretado: {path}\n"
-            f"Versão: {version}\n\n"
-            "Headers:\n"
-        )
+            parsed = urlsplit(target)
+            path = parsed.path or "/"
+            if parsed.query:
+                path += "?" + parsed.query
 
-        for k, v in headers.items():
-            response_body += f"{k}: {v}\n"
+            response_body = (
+                "Servidor Recebeu:\n"
+                f"Cliente TCP: {addr[0]}:{addr[1]}\n"
+                f"Método: {method}\n"
+                f"Target: {target}\n"
+                f"Path: {path}\n\n"
+            )
 
-        response_body += f"\nBody ({len(body)} bytes):\n{body.decode('utf-8', errors='replace')}\n"
+            for k, v in headers.items():
+                response_body += f"{k}: {v}\n"
 
-        conn.sendall(build_response(200, "OK", response_body))
+            response_body += f"\nBody:\n{body.decode(errors='replace')}"
+            connection_header = headers.get("connection", "").lower()
+            keep_alive = connection_header != "close"
+
+            response = build_response(
+                200,
+                "OK",
+                response_body,
+                keep_alive=keep_alive
+            )
+
+            conn.sendall(response)
+
+            if not keep_alive:
+                break
 
     except Exception as exc:
-        msg = f"Erro no servidor: {exc}"
-        conn.sendall(build_response(400, "Bad Request", msg))
+        conn.sendall(build_response(400, "Bad Request", str(exc), keep_alive=False))
     finally:
         conn.close()
 
