@@ -32,7 +32,7 @@ def main():
                 break
             response += chunk
 
-    print("\nResposta do servidor:\n")
+    print("\nResposta do servidor:")
     print(response.decode("utf-8", errors="replace"))
 
 
