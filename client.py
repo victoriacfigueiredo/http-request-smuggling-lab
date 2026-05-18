@@ -1,7 +1,7 @@
 import socket
 
 PROXY_HOST = "127.0.0.1"
-PROXY_PORT = 8091
+PROXY_PORT = 8092
 
 
 def recv_until(sock: socket.socket, marker: bytes):
