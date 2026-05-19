@@ -16,7 +16,7 @@ backend.mount_proc '/' do |req, res|
 
   res.status = 200
   res['Content-Type'] = 'text/plain'
-  res.body = "Resposta do servidorn"
+  res.body = "Resposta do servidor:"
 end
 
 trap('INT') { backend.shutdown }
