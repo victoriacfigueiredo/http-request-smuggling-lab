@@ -1,63 +1,210 @@
 import socket
 import threading
-from urllib.parse import urlsplit
-
+import re
+from urllib.parse import urlsplit, unquote_plus
 
 HOST = "127.0.0.1"
-PORT = 8092
+PORT = 8080
 
-MAX_HEADER_BYTES = 16 * 1024
-MAX_BODY_BYTES = 64 * 1024
-MAX_PATH_LEN = 2048
+NEXT_HOST = "127.0.0.1"
+NEXT_PORT = 8081
 
-BLOCKED_HEADER_NAMES = {
-    "x-original-url",
-    "x-rewrite-url",
+SERVER_NAME = "Security Proxy"
+
+MAX_HEADER_SIZE = 64 * 1024
+MAX_BODY_SIZE = 2 * 1024 * 1024
+
+ALLOWED_METHODS = {"GET", "POST", "HEAD", "PUT", "DELETE", "OPTIONS"}
+
+HOP_BY_HOP_DEFAULT = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "proxy-connection",
 }
 
-SUSPICIOUS_PATTERNS = [
-    "../",
-    "..\\",
-    "<script",
-    "' or 1=1",
-    "\" or 1=1",
-    "union select",
-    "sleep(",
-    "benchmark(",
+LAB_DESYNC_MODE = False 
+
+WAF_PATTERNS = [
+    re.compile(r"<\s*script", re.IGNORECASE),
+    re.compile(r"javascript\s*:", re.IGNORECASE),
+    re.compile(r"onerror\s*=", re.IGNORECASE),
+    re.compile(r"onload\s*=", re.IGNORECASE),
+    re.compile(r"<\s*iframe", re.IGNORECASE),
+    re.compile(r"\bunion\s+select\b", re.IGNORECASE),
+    re.compile(r"\bor\s+1\s*=\s*1\b", re.IGNORECASE),
+    re.compile(r"\band\s+1\s*=\s*1\b", re.IGNORECASE),
+    re.compile(r"'\s*or\s*'", re.IGNORECASE),
+    re.compile(r"--", re.IGNORECASE),
+    re.compile(r"/\*", re.IGNORECASE),
+    re.compile(r"\.\./"),
+    re.compile(r"\.\.\\"),
+    re.compile(r"%2e%2e", re.IGNORECASE),
+    re.compile(r"/etc/passwd", re.IGNORECASE),
+    re.compile(r"cmd\.exe", re.IGNORECASE),
+    re.compile(r"powershell", re.IGNORECASE),
 ]
 
 
-def recv_until(sock: socket.socket, marker: bytes, max_bytes: int | None = None):
+def recv_until(sock: socket.socket, marker: bytes):
     data = b""
+
     while marker not in data:
         chunk = sock.recv(4096)
         if not chunk:
             break
+
         data += chunk
-        if max_bytes is not None and len(data) > max_bytes:
-            raise ValueError("Cabeçalho maior que o permitido")
+
+        if len(data) > MAX_HEADER_SIZE:
+            raise ValueError("Header muito grande")
+
     return data
 
 
-def parse_header_lines(header_bytes: bytes):
+def build_error_response(status_code: int, reason: str, body: str):
+    body_bytes = body.encode("utf-8")
+
+    return (
+        f"HTTP/1.1 {status_code} {reason}\r\n"
+        f"Content-Type: text/plain; charset=utf-8\r\n"
+        f"Content-Length: {len(body_bytes)}\r\n"
+        f"Connection: close\r\n"
+        f"\r\n"
+    ).encode("iso-8859-1") + body_bytes
+
+
+def parse_headers(header_bytes: bytes):
     text = header_bytes.decode("iso-8859-1")
     lines = text.split("\r\n")
-    start_line = lines[0]
 
+    request_line = lines[0]
     headers = []
+
     for line in lines[1:]:
-        if not line:
+        if line == "":
             continue
+        if line.startswith((" ", "\t")):
+            raise ValueError("Header com obs-fold rejeitado")
+
         if ":" not in line:
-            continue
+            raise ValueError(f"Header inválido: {line!r}")
+
         name, value = line.split(":", 1)
-        headers.append((name.strip(), value.strip()))
+        name = name.strip()
+        value = value.strip()
 
-    return start_line, headers
+        if not name:
+            raise ValueError("Header sem nome")
+
+        if any(c in name for c in " \t\r\n"):
+            raise ValueError(f"Nome de header inválido: {name!r}")
+
+        headers.append((name, value))
+
+    return request_line, headers
 
 
-def headers_to_dict(headers):
-    return {k.lower(): v for k, v in headers}
+def get_all(headers, name: str):
+    lname = name.lower()
+    return [v for k, v in headers if k.lower() == lname]
+
+
+def validate_request_line(request_line: str):
+    parts = request_line.split(" ")
+
+    if len(parts) != 3:
+        raise ValueError("Request-Line inválida")
+
+    method, target, version = parts
+
+    if version != "HTTP/1.1":
+        raise ValueError("Apenas HTTP/1.1 é aceito")
+
+    if method.upper() not in ALLOWED_METHODS:
+        raise ValueError(f"Método bloqueado: {method}")
+
+    if "\r" in target or "\n" in target:
+        raise ValueError("Request-target inválido")
+
+    return method.upper(), target, version
+
+
+def normalize_target(method: str, target: str):
+    if method == "CONNECT":
+        raise ValueError("CONNECT não é suportado")
+
+    if target == "*":
+        return target
+
+    parsed = urlsplit(target)
+
+    if parsed.scheme or parsed.netloc:
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        return path
+
+    if not target.startswith("/"):
+        raise ValueError("Request-target precisa estar em origin-form ou absolute-form")
+
+    return target
+
+
+def validate_host(headers):
+    hosts = get_all(headers, "host")
+
+    if len(hosts) != 1:
+        raise ValueError("HTTP/1.1 exige exatamente um Host")
+
+    if hosts[0] == "":
+        raise ValueError("Host vazio")
+
+
+def validate_message_framing(headers):
+    cls = get_all(headers, "content-length")
+    tes = get_all(headers, "transfer-encoding")
+
+    if len(cls) > 1:
+        values = [v.strip() for v in cls]
+
+        if len(set(values)) != 1:
+            raise ValueError("Múltiplos Content-Length divergentes")
+
+        raise ValueError("Múltiplos Content-Length rejeitados")
+
+    if cls:
+        try:
+            cl = int(cls[0])
+        except ValueError:
+            raise ValueError("Content-Length inválido")
+
+        if cl < 0:
+            raise ValueError("Content-Length negativo")
+
+        if cl > MAX_BODY_SIZE:
+            raise ValueError("Body muito grande")
+
+    if tes and cls and not LAB_DESYNC_MODE:
+        raise ValueError("Ambiguidade TE + CL bloqueada")
+
+    if len(tes) > 1:
+        raise ValueError("Múltiplos Transfer-Encoding rejeitados")
+
+    if tes:
+        codings = [x.strip().lower() for x in tes[0].split(",")]
+
+        if codings[-1] != "chunked":
+            raise ValueError("Transfer-Encoding final precisa ser chunked")
+
+        for coding in codings:
+            if coding != "chunked":
+                raise ValueError(f"Transfer-Encoding não suportado: {coding}")
 
 
 def read_chunked_body(sock: socket.socket, initial_rest: bytes):
@@ -68,34 +215,41 @@ def read_chunked_body(sock: socket.socket, initial_rest: bytes):
         while b"\r\n" not in data:
             chunk = sock.recv(4096)
             if not chunk:
-                raise ConnectionError("Conexão encerrada durante leitura do chunk size")
+                raise ConnectionError("Conexão encerrada durante chunk-size")
             data += chunk
 
         line, data = data.split(b"\r\n", 1)
-        chunk_size = int(line.decode("ascii").strip(), 16)
+        line = line.split(b";", 1)[0].strip()
+
+        try:
+            chunk_size = int(line.decode("ascii"), 16)
+        except ValueError:
+            raise ValueError("Chunk-size inválido")
 
         if chunk_size == 0:
-            while len(data) < 2:
+            while b"\r\n" not in data:
                 chunk = sock.recv(4096)
                 if not chunk:
-                    raise ConnectionError("Conexão encerrada antes do fim do chunked body")
+                    raise ConnectionError("Conexão encerrada antes dos trailers")
                 data += chunk
 
-            if data[:2] != b"\r\n":
-                raise ValueError("Formato chunked inválido")
-            data = data[2:]
-            break
+            trailer_block, data = data.split(b"\r\n", 1)
 
-        if len(body) + chunk_size > MAX_BODY_BYTES:
-            raise ValueError("Body maior que o permitido")
+            if trailer_block:
+                raise ValueError("Trailers rejeitados por segurança")
+
+            break
 
         while len(data) < chunk_size + 2:
             chunk = sock.recv(4096)
             if not chunk:
-                raise ConnectionError("Conexão encerrada durante leitura do chunk")
+                raise ConnectionError("Conexão encerrada durante chunk-data")
             data += chunk
 
         body += data[:chunk_size]
+
+        if len(body) > MAX_BODY_SIZE:
+            raise ValueError("Body muito grande")
 
         if data[chunk_size:chunk_size + 2] != b"\r\n":
             raise ValueError("Chunk sem CRLF final")
@@ -106,7 +260,8 @@ def read_chunked_body(sock: socket.socket, initial_rest: bytes):
 
 
 def read_http_request(conn: socket.socket):
-    raw = recv_until(conn, b"\r\n\r\n", max_bytes=MAX_HEADER_BYTES)
+    raw = recv_until(conn, b"\r\n\r\n")
+
     if not raw:
         return None
 
@@ -114,231 +269,234 @@ def read_http_request(conn: socket.socket):
         raise ValueError("Cabeçalho HTTP incompleto")
 
     header_part, rest = raw.split(b"\r\n\r\n", 1)
-    request_line, headers = parse_header_lines(header_part)
-    header_dict = headers_to_dict(headers)
 
-    content_length = header_dict.get("content-length")
-    transfer_encoding = header_dict.get("transfer-encoding", "").lower()
+    request_line, headers = parse_headers(header_part)
 
-    if content_length and "chunked" in transfer_encoding:
-        raise ValueError("Content-Length e Transfer-Encoding juntos")
+    method, target, version = validate_request_line(request_line)
+    target = normalize_target(method, target)
 
-    if "chunked" in transfer_encoding:
-        body = read_chunked_body(conn, rest)
-    elif content_length is not None:
-        length = int(content_length)
-        if length > MAX_BODY_BYTES:
-            raise ValueError("Body maior que o permitido")
+    validate_host(headers)
+    validate_message_framing(headers)
+
+    cls = get_all(headers, "content-length")
+    tes = get_all(headers, "transfer-encoding")
+
+    body = b""
+
+    if LAB_DESYNC_MODE and cls and tes:
+        length = int(cls[0])
         body = rest
+
         while len(body) < length:
             chunk = conn.recv(4096)
             if not chunk:
                 raise ConnectionError("Conexão encerrada antes do body completo")
             body += chunk
+
         body = body[:length]
-    else:
-        body = b""
 
-    return request_line, headers, body
+    elif tes:
+        body = read_chunked_body(conn, rest)
 
-
-def read_http_response(sock: socket.socket):
-    raw = recv_until(sock, b"\r\n\r\n", max_bytes=MAX_HEADER_BYTES)
-    if not raw:
-        return None
-
-    if b"\r\n\r\n" not in raw:
-        raise ValueError("Cabeçalho HTTP incompleto")
-
-    header_part, rest = raw.split(b"\r\n\r\n", 1)
-    status_line, headers = parse_header_lines(header_part)
-    header_dict = headers_to_dict(headers)
-
-    content_length = header_dict.get("content-length")
-    transfer_encoding = header_dict.get("transfer-encoding", "").lower()
-
-    if content_length and "chunked" in transfer_encoding:
-        raise ValueError("Content-Length e Transfer-Encoding juntos")
-
-    if "chunked" in transfer_encoding:
-        body = read_chunked_body(sock, rest)
-    elif content_length is not None:
-        length = int(content_length)
+    elif cls:
+        length = int(cls[0])
         body = rest
+
         while len(body) < length:
-            chunk = sock.recv(4096)
+            chunk = conn.recv(4096)
             if not chunk:
                 raise ConnectionError("Conexão encerrada antes do body completo")
             body += chunk
+
         body = body[:length]
-    else:
-        body = rest
 
-    return status_line, headers, body
+    return method, target, version, headers, body
 
 
-def rebuild_http_message(start_line: str, headers, body: bytes):
-    data = start_line + "\r\n"
+def parse_connection_options(headers):
+    options = set()
+
+    for value in get_all(headers, "connection"):
+        for item in value.split(","):
+            item = item.strip().lower()
+            if item:
+                options.add(item)
+
+    return options
+
+
+def remove_hop_by_hop_headers(headers):
+    connection_options = parse_connection_options(headers)
+    forbidden = HOP_BY_HOP_DEFAULT | connection_options
+
+    clean = []
+
     for name, value in headers:
-        data += f"{name}: {value}\r\n"
-    data += "\r\n"
-    return data.encode("iso-8859-1") + body
+        if name.lower() in forbidden:
+            continue
+
+        clean.append((name, value))
+
+    return clean
 
 
-def build_error_response(status_code: int, reason: str, body: str, keep_alive: bool = False):
-    body_bytes = body.encode("utf-8")
-    connection_value = "keep-alive" if keep_alive else "close"
-    return (
-        f"HTTP/1.1 {status_code} {reason}\r\n"
-        f"Content-Type: text/plain; charset=utf-8\r\n"
-        f"Content-Length: {len(body_bytes)}\r\n"
-        f"Connection: {connection_value}\r\n"
-        f"\r\n"
-    ).encode("iso-8859-1") + body_bytes
+def inspect_with_waf(method: str, target: str, headers, body: bytes):
+    decoded_target = unquote_plus(target)
+    decoded_body = body.decode("utf-8", errors="ignore")
+    decoded_headers = "\n".join(f"{k}: {v}" for k, v in headers)
 
+    inspection_area = "\n".join([
+        method,
+        decoded_target,
+        decoded_headers,
+        decoded_body,
+    ])
 
-def inspect_request(request_line: str, headers, body: bytes):
-    parts = request_line.split(" ")
-    if len(parts) != 3:
-        return 400, "Bad Request", "Request-Line inválida"
+    for pattern in WAF_PATTERNS:
+        if pattern.search(inspection_area):
+            raise ValueError(f"Payload suspeito bloqueado: {pattern.pattern}")
 
-    method, target, version = parts
+def merge_via_headers(headers, server_name):
+    existing = []
 
-    if version != "HTTP/1.1":
-        return 400, "Bad Request", "Somente HTTP/1.1 é aceito neste lab"
+    for name, value in headers:
+        if name.lower() == "via":
+            existing.append(value)
 
-    if method.upper() not in {"GET", "POST", "HEAD", "OPTIONS"}:
-        return 405, "Method Not Allowed", f"Método não permitido: {method}"
+    existing.append(f"1.1 {server_name}")
 
-    parsed = urlsplit(target)
+    return ", ".join(existing)
 
-    if not parsed.scheme or not parsed.hostname:
-        return 400, "Bad Request", "O alvo deve estar em absolute-form"
+def build_forwarded_request(method, target, version, headers, body, client_ip):
+    if LAB_DESYNC_MODE:
+        clean_headers = []
 
-    path = parsed.path or "/"
-    if parsed.query:
-        path += "?" + parsed.query
+        for name, value in headers:
+            lname = name.lower()
 
-    if len(path) > MAX_PATH_LEN:
-        return 414, "URI Too Long", "Path maior que o permitido"
+            if lname in {
+                "connection",
+                "keep-alive",
+                "proxy-authenticate",
+                "proxy-authorization",
+                "te",
+                "trailer",
+                "upgrade",
+                "proxy-connection",
+            }:
+                continue
 
-    header_dict = headers_to_dict(headers)
+            clean_headers.append((name, value))
+    else:
+        clean_headers = remove_hop_by_hop_headers(headers)
 
-    for header_name in header_dict:
-        if header_name in BLOCKED_HEADER_NAMES:
-            return 403, "Forbidden", f"Header bloqueado: {header_name}"
-
-    content_type = header_dict.get("content-type", "").lower()
-    inspected_text = (path + "\n" + body.decode("utf-8", errors="replace")).lower()
-
-    for pattern in SUSPICIOUS_PATTERNS:
-        if pattern in inspected_text:
-            return 403, "Forbidden", f"Padrão suspeito detectado: {pattern}"
-
-    if "application/x-www-form-urlencoded" in content_type and len(body) > MAX_BODY_BYTES:
-        return 413, "Payload Too Large", "Body maior que o permitido"
-
-    return None
-
-
-def build_forwarded_request(request_line: str, headers, body: bytes, client_ip: str):
-    parts = request_line.split(" ")
-    method, target, version = parts
-    parsed = urlsplit(target)
-
-    upstream_host = parsed.hostname
-    upstream_port = parsed.port or 80
-
-    path = parsed.path or "/"
-    if parsed.query:
-        path += "?" + parsed.query
-
-    new_request_line = f"{method} {path} {version}"
-
-    filtered_headers = []
+    final_headers = []
     saw_host = False
     saw_xff = False
 
-    for name, value in headers:
+    via_value = merge_via_headers(clean_headers, SERVER_NAME)
+
+    for name, value in clean_headers:
         lname = name.lower()
 
-        if lname == "proxy-connection":
+        if lname == "via":
             continue
 
         if lname == "host":
-            filtered_headers.append(("Host", f"{upstream_host}:{upstream_port}"))
+            final_headers.append(("Host", f"{NEXT_HOST}:{NEXT_PORT}"))
             saw_host = True
             continue
 
-        if lname == "x-forwarded-for":
-            saw_xff = True
-            filtered_headers.append((name, value))
+        if lname == "content-length" and not LAB_DESYNC_MODE:
             continue
 
-        filtered_headers.append((name, value))
+        if lname == "x-forwarded-for":
+            final_headers.append(("X-Forwarded-For", f"{value}, {client_ip}"))
+            saw_xff = True
+            continue
+
+        final_headers.append((name, value))
 
     if not saw_host:
-        filtered_headers.append(("Host", f"{upstream_host}:{upstream_port}"))
+        final_headers.append(("Host", f"{NEXT_HOST}:{NEXT_PORT}"))
 
-    filtered_headers.append(("Via", "1.1 python-security-proxy"))
-    filtered_headers.append(("X-Security-Proxy", "python-lab"))
+    final_headers.append(("Via", via_value))
 
     if not saw_xff:
-        filtered_headers.append(("X-Forwarded-For", client_ip))
+        final_headers.append(("X-Forwarded-For", client_ip))
 
-    return upstream_host, upstream_port, rebuild_http_message(new_request_line, filtered_headers, body)
+    if not LAB_DESYNC_MODE:
+        final_headers.append(("Content-Length", str(len(body))))
+        final_headers.append(("Connection", "close"))
+    else:
+        final_headers.append(("Connection", "keep-alive"))
 
+    request_line = f"{method} {target} {version}\r\n"
+    header_block = "".join(f"{k}: {v}\r\n" for k, v in final_headers)
 
-def forward_request_to_upstream(host: str, port: int, request_bytes: bytes):
+    return (request_line + header_block + "\r\n").encode("iso-8859-1") + body
+
+def forward_to_next(request_bytes: bytes) -> bytes:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as upstream:
-        upstream.connect((host, port))
+        upstream.connect((NEXT_HOST, NEXT_PORT))
         upstream.sendall(request_bytes)
 
-        response = read_http_response(upstream)
-        if response is None:
-            raise ConnectionError("Upstream fechou sem responder")
+        response = b""
 
-        status_line, headers, body = response
-        return rebuild_http_message(status_line, headers, body)
+        while True:
+            chunk = upstream.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+
+        return response
 
 
 def handle_client(conn: socket.socket, addr):
     try:
-        while True:
-            request = read_http_request(conn)
-            if request is None:
-                break
+        request = read_http_request(conn)
 
-            request_line, headers, body = request
-            header_dict = headers_to_dict(headers)
+        if request is None:
+            return
 
-            inspection_result = inspect_request(request_line, headers, body)
-            if inspection_result is not None:
-                status_code, reason, message = inspection_result
-                print(f"[Security block] {addr[0]}:{addr[1]} | {request_line} | {message}")
-                keep_alive = header_dict.get("connection", "").lower() != "close"
-                conn.sendall(build_error_response(status_code, reason, message, keep_alive=keep_alive))
-                if not keep_alive:
-                    break
-                continue
+        method, target, version, headers, body = request
 
-            upstream_host, upstream_port, forwarded_request = build_forwarded_request(
-                request_line, headers, body, addr[0]
-            )
+        inspect_with_waf(method, target, headers, body)
 
-            print(f"[Security allow] {addr[0]}:{addr[1]} -> {upstream_host}:{upstream_port} | {request_line}")
+        print("\nSecurity Proxy Recebeu:")
+        print(f"Cliente: {addr[0]}:{addr[1]}")
+        print(f"Request-Line: {method} {target} {version}")
+        print("Headers:")
+        for h in headers:
+            print(h)
+        print(f"Body: {len(body)} bytes\n")
 
-            upstream_response = forward_request_to_upstream(
-                upstream_host, upstream_port, forwarded_request
-            )
+        forwarded_request = build_forwarded_request(
+            method,
+            target,
+            version,
+            headers,
+            body,
+            addr[0],
+        )
 
-            conn.sendall(upstream_response)
+        print("\nSecurity Proxy Enviando:")
+        print(f"Destino: {NEXT_HOST}:{NEXT_PORT}")
+        print(forwarded_request.decode("iso-8859-1", errors="replace"))
+        print("\n")
 
-            if header_dict.get("connection", "").lower() == "close":
-                break
+        response = forward_to_next(forwarded_request)
+        conn.sendall(response)
 
     except Exception as exc:
-        conn.sendall(build_error_response(400, "Bad Request", f"Erro no security proxy: {exc}", keep_alive=False))
+        conn.sendall(
+            build_error_response(
+                400,
+                "Bad Request",
+                f"Requisição bloqueada pelo security proxy: {exc}",
+            )
+        )
+
     finally:
         conn.close()
 
@@ -348,11 +506,16 @@ def main():
         proxy.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         proxy.bind((HOST, PORT))
         proxy.listen(50)
-        print(f"[Security proxy] ouvindo em {HOST}:{PORT}")
+
+        print(f"[Security Proxy] ouvindo em {HOST}:{PORT}")
 
         while True:
             conn, addr = proxy.accept()
-            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+            threading.Thread(
+                target=handle_client,
+                args=(conn, addr),
+                daemon=True,
+            ).start()
 
 
 if __name__ == "__main__":
